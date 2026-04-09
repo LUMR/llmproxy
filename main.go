@@ -5,14 +5,18 @@ import (
 	"log"
 	"os"
 
-	"litellm-proxy/config"
-	"litellm-proxy/handler"
-	"litellm-proxy/logger"
+	"anthropic-proxy/config"
+	"anthropic-proxy/handler"
+	"anthropic-proxy/langfuse"
+	"anthropic-proxy/logger"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// 加载 .env 文件（不存在也不报错）
+	godotenv.Load()
 	// 加载配置
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
@@ -35,8 +39,23 @@ func main() {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
+	// 初始化 Langfuse
+	var tracer *langfuse.Tracer
+	if cfg.Langfuse.Enabled {
+		if cfg.Langfuse.PublicKey == "" || cfg.Langfuse.SecretKey == "" {
+			log.Fatal("Langfuse enabled but LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required")
+		}
+		var err error
+		tracer, err = langfuse.NewTracer(&cfg.Langfuse)
+		if err != nil {
+			log.Fatalf("Failed to initialize Langfuse: %v", err)
+		}
+		defer tracer.Shutdown()
+		log.Printf("Langfuse tracing enabled, endpoint: %s", cfg.Langfuse.BaseURL)
+	}
+
 	// 创建代理处理器
-	proxyHandler := handler.NewProxyHandler(cfg, logInstance)
+	proxyHandler := handler.NewProxyHandler(cfg, logInstance, tracer)
 
 	// 设置 Gin
 	gin.SetMode(gin.ReleaseMode)

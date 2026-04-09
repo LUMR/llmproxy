@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"litellm-proxy/config"
+	"anthropic-proxy/config"
 )
 
 type RequestLog struct {
@@ -111,6 +111,8 @@ func (l *RequestLog) Finalize() {
 }
 
 func (l *Logger) Save(log *RequestLog) error {
+	log.Finalize()
+
 	// 控制台输出（始终执行）
 	l.printConsole(log)
 
@@ -118,8 +120,6 @@ func (l *Logger) Save(log *RequestLog) error {
 	if !l.cfg.Enabled {
 		return nil
 	}
-
-	log.Finalize()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -149,8 +149,6 @@ func (l *Logger) printConsole(log *RequestLog) {
 	if !l.cfg.Console {
 		return
 	}
-
-	log.Finalize()
 
 	// 时间和请求ID
 	timeStr := log.Timestamp.Format("15:04:05")

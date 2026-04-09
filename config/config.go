@@ -9,10 +9,11 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Zhipu       ZhipuConfig       `yaml:"zhipu"`
+	Server       ServerConfig      `yaml:"server"`
+	Zhipu        ZhipuConfig       `yaml:"zhipu"`
 	ModelMapping map[string]string `yaml:"model_mapping"`
-	Logging     LoggingConfig     `yaml:"logging"`
+	Logging      LoggingConfig     `yaml:"logging"`
+	Langfuse     LangfuseConfig    `yaml:"langfuse"`
 }
 
 type ServerConfig struct {
@@ -30,6 +31,13 @@ type LoggingConfig struct {
 	Dir        string `yaml:"dir"`
 	FilePrefix string `yaml:"file_prefix"`
 	Console    bool   `yaml:"console"` // 控制台美化输出
+}
+
+type LangfuseConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	PublicKey string `yaml:"public_key"`
+	SecretKey string `yaml:"secret_key"`
+	BaseURL   string `yaml:"base_url"`
 }
 
 func Load(path string) (*Config, error) {
@@ -54,7 +62,7 @@ func (c *Config) MapModel(anthropicModel string) string {
 		return mapped
 	}
 	// 默认映射
-	return "glm-4-plus"
+	return "glm-5.1"
 }
 
 // expandEnvVars 展开配置中的环境变量 ${VAR} 或 $VAR

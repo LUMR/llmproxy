@@ -8,23 +8,26 @@ import (
 	"strings"
 	"time"
 
-	"litellm-proxy/config"
-	"litellm-proxy/logger"
+	"anthropic-proxy/config"
+	"anthropic-proxy/langfuse"
+	"anthropic-proxy/logger"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
 type ProxyHandler struct {
-	cfg    *config.Config
-	logger *logger.Logger
-	client *http.Client
+	cfg     *config.Config
+	logger  *logger.Logger
+	client  *http.Client
+	tracer  *langfuse.Tracer
 }
 
-func NewProxyHandler(cfg *config.Config, log *logger.Logger) *ProxyHandler {
+func NewProxyHandler(cfg *config.Config, log *logger.Logger, tracer *langfuse.Tracer) *ProxyHandler {
 	return &ProxyHandler{
 		cfg:    cfg,
 		logger: log,
+		tracer: tracer,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
@@ -53,9 +56,12 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 
 	// 获取并映射模型名
 	model := ""
+	mappedModel := ""
 	if reqData != nil {
 		if m, ok := reqData["model"].(string); ok {
 			model = m
+			mappedModel = h.cfg.MapModel(model)
+			reqData["model"] = mappedModel
 			reqBody, _ = json.Marshal(reqData)
 		}
 	}
@@ -69,9 +75,12 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 	}
 
 	// 创建日志
-	reqLog := h.logger.NewLog(requestID, model, model, isStream)
+	reqLog := h.logger.NewLog(requestID, model, mappedModel, isStream)
 	reqLog.SetRequest(reqData)
 	reqLog.SetHTTPInfo(method, path)
+
+	// 创建 Langfuse trace
+	langfuseCtx := h.tracer.StartTrace(requestID, model, reqData)
 
 	// 构建目标 URL
 	targetURL := h.cfg.Zhipu.APIBase + "/" + path
@@ -88,6 +97,7 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 
 	if err != nil {
 		reqLog.SetError(err.Error())
+		h.tracer.FinishGenerationError(langfuseCtx, err.Error())
 		h.logger.Save(reqLog)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
 		return
@@ -104,6 +114,7 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 	resp, err := h.client.Do(httpReq)
 	if err != nil {
 		reqLog.SetError(err.Error())
+		h.tracer.FinishGenerationError(langfuseCtx, err.Error())
 		h.logger.Save(reqLog)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to reach upstream", "detail": err.Error()})
 		return
@@ -114,6 +125,7 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
 		reqLog.SetError(string(respBody))
+		h.tracer.FinishGenerationError(langfuseCtx, string(respBody))
 		h.logger.Save(reqLog)
 		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 		return
@@ -122,18 +134,19 @@ func (h *ProxyHandler) HandleAll(c *gin.Context) {
 	// 流式响应
 	contentType := resp.Header.Get("Content-Type")
 	if isStream || strings.Contains(contentType, "text/event-stream") {
-		h.handleStreamResponse(c, resp, reqLog)
+		h.handleStreamResponse(c, resp, reqLog, langfuseCtx)
 		return
 	}
 
 	// 非流式响应
-	h.handleNormalResponse(c, resp, reqLog)
+	h.handleNormalResponse(c, resp, reqLog, langfuseCtx)
 }
 
-func (h *ProxyHandler) handleNormalResponse(c *gin.Context, resp *http.Response, reqLog *logger.RequestLog) {
+func (h *ProxyHandler) handleNormalResponse(c *gin.Context, resp *http.Response, reqLog *logger.RequestLog, langfuseCtx *langfuse.TraceContext) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reqLog.SetError(err.Error())
+		h.tracer.FinishGenerationError(langfuseCtx, err.Error())
 		h.logger.Save(reqLog)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read response"})
 		return
@@ -144,16 +157,23 @@ func (h *ProxyHandler) handleNormalResponse(c *gin.Context, resp *http.Response,
 
 	// 记录日志
 	reqLog.SetResponse(respData)
+	var inputTokens, outputTokens int
 	if respData != nil {
 		if usage, ok := respData["usage"].(map[string]interface{}); ok {
-			reqLog.SetTokenUsage(
-				int(getFloat(usage, "input_tokens")),
-				int(getFloat(usage, "output_tokens")),
-				int(getFloat(usage, "input_tokens"))+int(getFloat(usage, "output_tokens")),
-			)
+			inputTokens = int(getFloat(usage, "input_tokens"))
+			outputTokens = int(getFloat(usage, "output_tokens"))
+			reqLog.SetTokenUsage(inputTokens, outputTokens, inputTokens+outputTokens)
 		}
 	}
 	reqLog.SetSuccess()
+
+	// 更新 Langfuse trace
+	var output interface{}
+	if respData != nil {
+		output = respData
+	}
+	h.tracer.FinishGenerationSuccess(langfuseCtx, output, inputTokens, outputTokens)
+
 	h.logger.Save(reqLog)
 
 	contentType := resp.Header.Get("Content-Type")
@@ -163,7 +183,7 @@ func (h *ProxyHandler) handleNormalResponse(c *gin.Context, resp *http.Response,
 	c.Data(http.StatusOK, contentType, body)
 }
 
-func (h *ProxyHandler) handleStreamResponse(c *gin.Context, resp *http.Response, reqLog *logger.RequestLog) {
+func (h *ProxyHandler) handleStreamResponse(c *gin.Context, resp *http.Response, reqLog *logger.RequestLog, langfuseCtx *langfuse.TraceContext) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -205,6 +225,11 @@ func (h *ProxyHandler) handleStreamResponse(c *gin.Context, resp *http.Response,
 		reqLog.SetTokenUsage(inputTokens, outputTokens, inputTokens+outputTokens)
 	}
 	reqLog.SetSuccess()
+
+	// 拼接流式内容并上报 Langfuse
+	assembledOutput := langfuse.AssembleStreamContent(reqLog.StreamChunks)
+	h.tracer.FinishGenerationSuccess(langfuseCtx, assembledOutput, inputTokens, outputTokens)
+
 	h.logger.Save(reqLog)
 }
 
