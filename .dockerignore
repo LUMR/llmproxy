@@ -1,0 +1,10 @@
+.git
+.claude
+.codefree
+logs/
+*.exe
+*.yaml
+*.bat
+README.md
+CLAUDE.md
+LICENSE

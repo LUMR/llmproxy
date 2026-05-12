@@ -9,10 +9,17 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Zhipu       ZhipuConfig       `yaml:"zhipu"`
+	Server       ServerConfig      `yaml:"server"`
+	Auth         AuthConfig        `yaml:"auth"`
+	Zhipu        UpstreamConfig    `yaml:"zhipu"`
+	OpenAI       UpstreamConfig    `yaml:"openai"`
 	ModelMapping map[string]string `yaml:"model_mapping"`
-	Logging     LoggingConfig     `yaml:"logging"`
+	Logging      LoggingConfig     `yaml:"logging"`
+}
+
+type AuthConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	BearerToken string `yaml:"bearer_token"`
 }
 
 type ServerConfig struct {
@@ -20,7 +27,7 @@ type ServerConfig struct {
 	Host string `yaml:"host"`
 }
 
-type ZhipuConfig struct {
+type UpstreamConfig struct {
 	APIBase string `yaml:"api_base"`
 	APIKey  string `yaml:"api_key"`
 }
@@ -54,7 +61,7 @@ func (c *Config) MapModel(anthropicModel string) string {
 		return mapped
 	}
 	// 默认映射
-	return "glm-4-plus"
+	return anthropicModel
 }
 
 // expandEnvVars 展开配置中的环境变量 ${VAR} 或 $VAR

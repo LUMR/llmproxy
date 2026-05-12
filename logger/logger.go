@@ -6,38 +6,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"litellm-proxy/config"
 )
 
 type RequestLog struct {
-	Timestamp     time.Time              `json:"timestamp"`
-	RequestID     string                 `json:"request_id"`
-	Model         string                 `json:"model"`
-	MappedModel   string                 `json:"mapped_model"`
-	Request       map[string]interface{} `json:"request"`
-	Response      interface{}            `json:"response,omitempty"`
-	StreamChunks  []interface{}          `json:"stream_chunks,omitempty"`
-	Duration      int64                  `json:"duration_ms"`
-	IsStream      bool                   `json:"is_stream"`
-	Success       bool                   `json:"success"`
-	ErrorMessage  string                 `json:"error_message,omitempty"`
-	TokenUsage    *TokenUsage            `json:"token_usage,omitempty"`
-	Method        string                 `json:"method,omitempty"`
-	Path          string                 `json:"path,omitempty"`
+	Timestamp    time.Time              `json:"timestamp"`
+	RequestID    string                 `json:"request_id"`
+	Model        string                 `json:"model"`
+	MappedModel  string                 `json:"mapped_model"`
+	Request      map[string]interface{} `json:"request"`
+	Response     interface{}            `json:"response,omitempty"`
+	Duration     int64                  `json:"duration_ms"`
+	IsStream     bool                   `json:"is_stream"`
+	Success      bool                   `json:"success"`
+	ErrorMessage string                 `json:"error_message,omitempty"`
+	TokenUsage   *TokenUsage            `json:"token_usage,omitempty"`
+	Method       string                 `json:"method,omitempty"`
+	Path         string                 `json:"path,omitempty"`
 }
 
 type TokenUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
-}
-
-type Logger struct {
-	cfg *config.LoggingConfig
-	mu  sync.Mutex
 }
 
 // ANSI 颜色代码
@@ -52,45 +45,53 @@ const (
 	colorBold    = "\033[1m"
 )
 
+type Logger struct {
+	cfg *config.LoggingConfig
+	ch  chan *RequestLog
+	done chan struct{}
+}
+
 func New(cfg *config.LoggingConfig) (*Logger, error) {
 	if cfg.Dir != "" {
 		if err := os.MkdirAll(cfg.Dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create log directory: %w", err)
 		}
 	}
-	return &Logger{cfg: cfg}, nil
+
+	l := &Logger{
+		cfg:  cfg,
+		ch:   make(chan *RequestLog, 256),
+		done: make(chan struct{}),
+	}
+
+	// 启动后台写入 goroutine
+	go l.writeLoop()
+
+	return l, nil
+}
+
+// writeLoop 后台消费日志，串行写入文件
+func (l *Logger) writeLoop() {
+	for log := range l.ch {
+		l.writeToFile(log)
+	}
+	close(l.done)
+}
+
+// Close 等待所有日志写入完成
+func (l *Logger) Close() {
+	close(l.ch)
+	<-l.done
 }
 
 func (l *Logger) NewLog(requestID, model, mappedModel string, isStream bool) *RequestLog {
 	return &RequestLog{
-		Timestamp:    time.Now(),
-		RequestID:    requestID,
-		Model:        model,
-		MappedModel:  mappedModel,
-		IsStream:     isStream,
-		StreamChunks: make([]interface{}, 0),
+		Timestamp:   time.Now(),
+		RequestID:   requestID,
+		Model:       model,
+		MappedModel: mappedModel,
+		IsStream:    isStream,
 	}
-}
-
-func (l *RequestLog) SetRequest(req map[string]interface{}) {
-	l.Request = req
-}
-
-func (l *RequestLog) SetResponse(resp interface{}) {
-	l.Response = resp
-}
-
-func (l *RequestLog) AddStreamChunk(chunk interface{}) {
-	l.StreamChunks = append(l.StreamChunks, chunk)
-}
-
-func (l *RequestLog) SetError(err string) {
-	l.Success = false
-	l.ErrorMessage = err
-}
-
-func (l *RequestLog) SetSuccess() {
-	l.Success = true
 }
 
 func (l *RequestLog) SetTokenUsage(prompt, completion, total int) {
@@ -101,47 +102,52 @@ func (l *RequestLog) SetTokenUsage(prompt, completion, total int) {
 	}
 }
 
-func (l *RequestLog) SetHTTPInfo(method, path string) {
-	l.Method = method
-	l.Path = path
-}
-
 func (l *RequestLog) Finalize() {
 	l.Duration = time.Since(l.Timestamp).Milliseconds()
 }
 
+// Save 提交日志到异步 channel，不阻塞调用方
 func (l *Logger) Save(log *RequestLog) error {
-	// 控制台输出（始终执行）
+	// 控制台输出（同步，因为 print 是线程安全的）
 	l.printConsole(log)
 
-	// 文件日志
 	if !l.cfg.Enabled {
 		return nil
 	}
 
 	log.Finalize()
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	// 非阻塞发送，channel 满时丢弃（避免内存无限增长）
+	select {
+	case l.ch <- log:
+	default:
+		fmt.Fprintf(os.Stderr, "[logger] channel full, dropping log for request %s\n", log.RequestID)
+	}
 
-	// 按日期分文件
+	return nil
+}
+
+// writeToFile 串行写入文件（只在 writeLoop 中调用）
+func (l *Logger) writeToFile(log *RequestLog) {
 	dateStr := time.Now().Format("2006-01-02")
 	filename := fmt.Sprintf("%s_%s.jsonl", l.cfg.FilePrefix, dateStr)
 	path := filepath.Join(l.cfg.Dir, filename)
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
+		fmt.Fprintf(os.Stderr, "[logger] failed to open log file: %v\n", err)
+		return
 	}
 	defer f.Close()
 
 	data, err := json.Marshal(log)
 	if err != nil {
-		return fmt.Errorf("failed to marshal log: %w", err)
+		fmt.Fprintf(os.Stderr, "[logger] failed to marshal log: %v\n", err)
+		return
 	}
 
-	_, err = f.WriteString(string(data) + "\n")
-	return err
+	f.Write(data)
+	f.Write([]byte{'\n'})
 }
 
 // printConsole 输出美化的控制台日志
